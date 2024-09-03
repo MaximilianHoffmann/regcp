@@ -1,21 +1,71 @@
 from cupyx.scipy.ndimage import gaussian_filter
+from cupyx.scipy import interpolate 
 import cupy as cp
 import numpy as np
 from tqdm import tqdm
 
 class RegCP:
-    def __init__(self,vol: np.ndarray, smooth_sigma: float = 1.2, sig_map: float = 2,subsample: int = 1,bin_factor: int = 1,mem_limit: int = 12):
+    def __init__(self,vol: np.ndarray, smooth_sigma: float = 1.2, sig_map: float = 2,subsample: int = 1,bin_factor: int = 1,mem_limit: int = 12,n_avg: int = 10,do_line_corr:bool=True):
+        """
+        Initialize the RegCP (Registration with CuPy) object.
+
+        This class is designed for registering volumetric image stacks using GPU acceleration.
+
+        Parameters:
+        -----------
+        vol : np.ndarray
+            Input volumetric image stack.
+        smooth_sigma : float, optional
+            Sigma for Gaussian smoothing of input images. Default is 1.2.
+        sig_map : float, optional
+            Sigma for Gaussian smoothing of correlation map. Default is 2.
+        subsample : int, optional
+            Subsampling factor for registration. Default is 1.
+        bin_factor : int, optional
+            Binning factor for registration. Default is 1.
+        mem_limit : int, optional
+            Memory limit in GB for GPU operations. Default is 12.
+        n_avg : int, optional
+            Number of images to average for reference image. Default is 10.
+        do_line_corr : bool, optional
+            Whether to perform line correction. Default is True.
+        """
         self.vol = vol
         self.smooth_sigma = smooth_sigma
         self.sig_map = sig_map
         self.subsample = subsample
         self.bin_factor = bin_factor
         self.mem_limit = mem_limit
+        self.ref_vol=None
+        self.do_line_corr=do_line_corr
+        self.n_avg=n_avg
+        if self.do_line_corr:
+            self.line_corr_shift=np.zeros(self.vol.shape[1])
+    
+    def build_reference_volume(self):
+        """
+        Constructs a reference volume for image registration by processing each plane of the input volume.
+
+        This method iterates through each plane of self.vol, performing the following operations:
+        1. Converts each plane to a CuPy array of type 'single'.
+        2. Applies binning (factor: self.bin_factor) and subsampling (factor: self.subsample).
+        3. Utilizes build_ref_image() to create a reference image for each plane.
+        4. If self.do_line_corr is True, performs resonant scanning correction:
+           - Calculates shift using resonant_scanning_correction().
+           - Applies the shift to even lines of the reference image.
+        5. Stores the processed plane in self.ref_vol.
 
 
-    def determine_shifts(self):
-        shift_list=[]
-        for ii in tqdm(range(self.vol.shape[1]),desc="Determining shifts"):
+        Modifies:
+            self.ref_vol (np.ndarray): Initialized as zeros, shape matches a single plane of self.vol.
+            self.line_corr_shift (np.ndarray): If line correction is enabled, stores shifts for each plane.
+
+        Note:
+            Assumes self.vol, self.bin_factor, self.subsample, self.do_line_corr, and self.n_avg are pre-defined.
+            Requires sufficient memory to process individual planes.
+        """
+        self.ref_vol = np.zeros_like(self.vol[0].squeeze(),dtype=np.float32)
+        for ii in tqdm(range(self.vol.shape[1])):
             plane=self.vol[:,ii,:,:]
             pl_c=cp.array(plane,'single')
             
@@ -24,9 +74,47 @@ class RegCP:
             pl_b = cp.copy(pl_c[:(pl_c.shape[0]//n_bin)*n_bin].reshape(pl_c.shape[0]//n_bin, n_bin, pl_c.shape[1], pl_c.shape[2]).mean(1)[::sub])
             del pl_c
             cp._default_memory_pool.free_all_blocks()   
-            ref_im=cp.copy(pl_b[pl_b.shape[0]//2])
+            ref_im=build_ref_image(pl_b, self.n_avg)
+            if self.do_line_corr:
+                shift=resonant_scanning_correction(ref_im,axis=1)
+                self.line_corr_shift[ii]=shift
+                ref_im[::2]=cp.roll(ref_im[::2],shift,1)
+            self.ref_vol[ii]=ref_im.get()
+            del pl_b,ref_im
+            
+   
+
+    def determine_shifts(self):
+        """
+        Determine shifts between each plane of the input volume and the reference volume.
+
+        This method iterates through each plane of self.vol, performing the following operations:
+        1. Converts each plane to a CuPy array of type 'single'.
+        2. Applies binning (factor: self.bin_factor) and subsampling (factor: self.subsample).
+        3. Registers the processed plane with the reference image using register_plane().
+        4. Stores the computed shifts in shift_list.
+
+        Returns:
+            shift_list (list): List of shift arrays, each corresponding to a plane in self.vol.
+        """
+        shift_list=[]
+        for ii in tqdm(range(self.vol.shape[1]),desc="Determining shifts"):
+            plane=self.vol[:,ii,:,:]
+            pl_c=cp.array(plane,'single')
+            
+            n_bin = self.bin_factor
+            sub = self.subsample
+            shift_ind=cp.arange(0,pl_c.shape[0],n_bin)[::sub]
+            pl_b = cp.copy(pl_c[:(pl_c.shape[0]//n_bin)*n_bin].reshape(pl_c.shape[0]//n_bin, n_bin, pl_c.shape[1], pl_c.shape[2]).mean(1)[::sub])
+            del pl_c
+            cp._default_memory_pool.free_all_blocks()   
+            ref_im=cp.array(self.ref_vol[ii],'single')
+            if self.do_line_corr:
+                pl_b[:,::2,:]=cp.roll(pl_b[:,::2,:],self.line_corr_shift[ii],1)
             shifts,corr=register_plane(ref_im,pl_b)
-            shift_list.append(shifts)
+            all_indices = cp.arange(self.vol.shape[0])
+            shift_all = interpolate.interpn((shift_ind,),shifts.T,(all_indices,),method='nearest',bounds_error=False,fill_value=None)
+            shift_list.append(shift_all.get())
             del shifts,corr,pl_b,ref_im
             cp._default_memory_pool.free_all_blocks()
         return shift_list
@@ -60,8 +148,30 @@ def free_gpu_memory(func):
         return retval
     return wrapper_func
 
+def build_ref_image(pl_b: cp.ndarray, n_avg: int = 10) -> cp.ndarray:
+    """
+    Build a reference image from a stack of images.
 
-        
+    Parameters:
+    -----------
+    pl_b : cp.ndarray
+        Stack of images to be averaged.
+    n_avg : int, optional
+        Number of images to average. Default is 10.
+
+    Returns:
+    --------
+    ref_im : cp.ndarray
+        Reference image.
+    """
+    mid_image = pl_b[pl_b.shape[0] // 2]    
+    pl_b_whitened = (pl_b - cp.mean(pl_b, axis=(1, 2))[:, None, None]) / cp.std(pl_b, axis=(1, 2))[:, None, None]
+    mid_image_whitened = (mid_image - cp.mean(mid_image)) / cp.std(mid_image)
+    correlations = cp.sum(pl_b_whitened * mid_image_whitened, axis=(1, 2))
+    top_indices = cp.argsort(correlations)[-n_avg:]
+    ref_im = cp.mean(pl_b[top_indices], axis=0)
+    del pl_b_whitened, mid_image_whitened, correlations, top_indices
+    return ref_im
 
 
 
@@ -156,3 +266,40 @@ def apply_shifts(pl_b: cp.ndarray, shifts: cp.ndarray) -> cp.ndarray:
     shifted_pl_b = pl_b[cp.arange(num_images)[:, None, None], y_shifted.astype(int), x_shifted.astype(int)]
     
     return shifted_pl_b
+
+
+@free_gpu_memory
+def resonant_scanning_correction(img: cp.ndarray, axis=1) -> cp.ndarray:
+    """
+    Perform resonant scanning correction on an image.
+
+    This function corrects for the distortion caused by resonant scanning in microscopy images.
+    It calculates the shift between odd and even lines of the image using Fourier analysis.
+
+    Parameters:
+    -----------
+    img : cp.ndarray
+        Input image to be corrected. Should be a 2D CuPy array.
+    axis : int, optional
+        Axis along which to perform the correction. Default is 1 (columns).
+        Use 0 for rows, 1 for columns.
+
+    Returns:
+    --------
+    shift : float
+        The calculated shift between odd and even lines of the image.
+        This value can be used to correct the resonant scanning distortion.
+
+    """
+    if axis==0:
+        ref_img=img.T
+    else:
+        ref_img=img
+
+    ref_w=(ref_img-ref_img.mean(axis=1,keepdims=True))/ref_img.std(axis=1,keepdims=True)
+    ref_ft=cp.fft.fft(ref_w,axis=1)
+    odd=ref_ft[1::2,:]
+    even=ref_ft[::2,:]    
+    corr=cp.real(cp.fft.ifft(odd*cp.conj(even),axis=1))
+    shift=cp.argmax(cp.fft.fftshift(corr.mean(0)))-ref_w.shape[1]//2
+    return shift
