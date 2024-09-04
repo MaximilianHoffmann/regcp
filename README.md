@@ -1,5 +1,5 @@
 # REGCP
-
+## !! Work in progress !!
 REGCP is a Python package for registering volumetric image stacks using GPU acceleration. Should eventually be a drop in replacement for suite2p registration.
 
 Currently:
@@ -37,6 +37,8 @@ reg_run_loaded=regcp.load_reg_run(p_out)
 vol_reg=regcp.apply_shifts(vol,reg_run_loaded.shifts,reg_run_loaded.line_corr_shift,inplace=False)
 
 ```
+Currently 17.2 s for a datset of size (39000, 5, 256, 128) and temporal binning of 2 on
+a NVIDIA GeForce RTX 4090
 
 ## See Also
 
