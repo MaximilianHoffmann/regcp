@@ -180,20 +180,23 @@ class RegCP:
         self.shifts=np.array(shift_list)
         return self.shifts
                         
-    def apply_shifts(self,vol=None,max_shifts=20):
-        shifts=self.shifts
-        if vol is None:
-            vol=self.vol
-        ix=(np.abs(shifts)>max_shifts)
-        shifts[ix]=0
-        for ii,sh in enumerate(self.line_corr_shift):
-            vol[:,ii,::2,:]=np.roll(self.vol[:,ii,::2,:],int(sh),axis=2)
-        for iplane in range(vol.shape[1]):
-            for ii in tqdm(range(vol.shape[0])):
-                s=shifts[iplane][ii]
-                vol[ii,iplane]=np.roll(np.roll(vol[ii,iplane],int(s[0]),axis=0),int(s[1]),axis=1)
-        return vol
-        
+    def apply_shifts(self,max_shifts=20):
+        return apply_shifts(self.vol,self.shifts,self.line_corr_shift,max_shifts,True)
+
+def apply_shifts(vol,shifts,line_corr_shift,max_shifts=20,inplace=True):
+    if inplace:
+        vol_out=vol
+    else:
+        vol_out=np.zeros_like(vol)
+    ix=(np.abs(shifts)>max_shifts)
+    shifts[ix]=0
+    for ii,sh in enumerate(line_corr_shift):
+        vol_out[:,ii,::2,:]=np.roll(vol[:,ii,::2,:],int(sh),axis=2)
+    for iplane in range(vol.shape[1]):
+        for ii in tqdm(range(vol.shape[0])):
+            s=shifts[iplane][ii]
+            vol_out[ii,iplane]=np.roll(np.roll(vol[ii,iplane],int(s[0]),axis=0),int(s[1]),axis=1)
+    return vol_out
 
 def free_gpu_memory(func):
     """
@@ -316,28 +319,28 @@ def register_plane(im_ref: cp.ndarray, pl_b: cp.ndarray, eps: float = 200, sig: 
     return shift, corr
 
 
-@free_gpu_memory
-def apply_shifts(pl_b: cp.ndarray, shifts: cp.ndarray) -> cp.ndarray:
-    """
-    Apply 2D shifts to a stack of images efficiently without using a loop.
+# @free_gpu_memory
+# def apply_shifts(pl_b: cp.ndarray, shifts: cp.ndarray) -> cp.ndarray:
+#     """
+#     Apply 2D shifts to a stack of images efficiently without using a loop.
 
-    Parameters:
-    -----------
-    pl_b : cp.ndarray
-        Stack of images to be shifted.
-    shifts : cp.ndarray
-        Array of shifts to apply, shape (2, num_images).
+#     Parameters:
+#     -----------
+#     pl_b : cp.ndarray
+#         Stack of images to be shifted.
+#     shifts : cp.ndarray
+#         Array of shifts to apply, shape (2, num_images).
 
-    Returns:
-    --------
-    shifted_pl_b : cp.ndarray
-        Shifted version of pl_b.
-    """
-    num_images = pl_b.shape[0]
-    y, x = cp.meshgrid(cp.arange(pl_b.shape[1]), cp.arange(pl_b.shape[2]), indexing='ij')
-    y_shifted = (y[None, :, :] - shifts[0, :, None, None]) % pl_b.shape[1]
-    x_shifted = (x[None, :, :] - shifts[1, :, None, None]) % pl_b.shape[2]
-    shifted_pl_b = pl_b[cp.arange(num_images)[:, None, None], y_shifted.astype(int), x_shifted.astype(int)]
+#     Returns:
+#     --------
+#     shifted_pl_b : cp.ndarray
+#         Shifted version of pl_b.
+#     """
+#     num_images = pl_b.shape[0]
+#     y, x = cp.meshgrid(cp.arange(pl_b.shape[1]), cp.arange(pl_b.shape[2]), indexing='ij')
+#     y_shifted = (y[None, :, :] - shifts[0, :, None, None]) % pl_b.shape[1]
+#     x_shifted = (x[None, :, :] - shifts[1, :, None, None]) % pl_b.shape[2]
+#     shifted_pl_b = pl_b[cp.arange(num_images)[:, None, None], y_shifted.astype(int), x_shifted.astype(int)]
     
     return shifted_pl_b
 
