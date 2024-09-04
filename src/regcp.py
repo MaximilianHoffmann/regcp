@@ -3,6 +3,7 @@ from cupyx.scipy import interpolate
 import cupy as cp
 import numpy as np
 from tqdm import tqdm
+import h5py
 
 class RegCP:
     def __init__(self,vol: np.ndarray, smooth_sigma: float = 1.2, sig_map: float = 2,subsample: int = 1,bin_factor: int = 1,mem_limit: int = 12,n_avg: int = 10,do_line_corr:bool=True):
@@ -37,10 +38,69 @@ class RegCP:
         self.bin_factor = bin_factor
         self.mem_limit = mem_limit
         self.ref_vol=None
+        self.shifts=None
         self.do_line_corr=do_line_corr
         self.n_avg=n_avg
-        if self.do_line_corr:
-            self.line_corr_shift=np.zeros(self.vol.shape[1])
+        self.line_corr_shift=np.zeros(self.vol.shape[1])
+            
+    def get_parameters(self) -> dict:
+        """
+        Returns the current parameters of the RegCP object as a dictionary.
+
+        Returns:
+        --------
+        dict
+            A dictionary containing the current parameter values.
+        """
+        return {
+            'smooth_sigma': self.smooth_sigma,
+            'sig_map': self.sig_map,
+            'subsample': self.subsample,
+            'bin_factor': self.bin_factor,
+            'mem_limit': self.mem_limit,
+            'n_avg': self.n_avg,
+            'do_line_corr': self.do_line_corr,
+            'shifts': self.shifts,
+            'line_corr_shift': self.line_corr_shift,
+            'ref_vol': self.ref_vol
+        }
+        
+    def save_reg_run(self, filename: str):
+        """
+        Writes the current parameters to an HDF5 file.
+
+        Parameters:
+        -----------
+        filename : str
+            The name of the HDF5 file to write to.
+        """
+        params = self.get_parameters()
+        with h5py.File(filename, 'w') as f:
+            for key, value in params.items():
+                if isinstance(value, (np.ndarray, list)):
+                    f.create_dataset(key, data=value, compression="gzip")
+                else:
+                    f.attrs[key] = value
+    
+    def load_reg_run(self, filename: str):
+        """
+        Loads parameters from an HDF5 file and sets them as attributes of the RegCP object.
+
+        Parameters:
+        -----------
+        filename : str
+            The name of the HDF5 file to read from.
+        """
+        with h5py.File(filename, 'r') as f:
+            for key in self.get_parameters().keys():
+                if key in f:
+                    setattr(self, key, f[key][()])
+                elif key in f.attrs:
+                    setattr(self, key, f.attrs[key])
+                else:
+                    print(f"Warning: '{key}' not found in the HDF5 file.")
+
+      
     
     def build_reference_volume(self):
         """
@@ -117,10 +177,22 @@ class RegCP:
             shift_list.append(shift_all.get())
             del shifts,corr,pl_b,ref_im
             cp._default_memory_pool.free_all_blocks()
-        return shift_list
+        self.shifts=np.array(shift_list)
+        return self.shifts
                         
-
-        
+    def apply_shifts(self,vol=None,max_shifts=20):
+        shifts=self.shifts
+        if vol is None:
+            vol=self.vol
+        ix=(np.abs(shifts)>max_shifts)
+        shifts[ix]=0
+        for ii,sh in enumerate(self.line_corr_shift):
+            vol[:,ii,::2,:]=np.roll(self.vol[:,ii,::2,:],int(sh),axis=2)
+        for iplane in range(vol.shape[1]):
+            for ii in tqdm(range(vol.shape[0])):
+                s=shifts[iplane][ii]
+                vol[ii,iplane]=np.roll(np.roll(vol[ii,iplane],int(s[0]),axis=0),int(s[1]),axis=1)
+        return vol
         
 
 def free_gpu_memory(func):
@@ -164,6 +236,7 @@ def build_ref_image(pl_b: cp.ndarray, n_avg: int = 10) -> cp.ndarray:
     ref_im : cp.ndarray
         Reference image.
     """
+    #TODO iteratively register images
     mid_image = pl_b[pl_b.shape[0] // 2]    
     pl_b_whitened = (pl_b - cp.mean(pl_b, axis=(1, 2))[:, None, None]) / cp.std(pl_b, axis=(1, 2))[:, None, None]
     mid_image_whitened = (mid_image - cp.mean(mid_image)) / cp.std(mid_image)
@@ -233,11 +306,12 @@ def register_plane(im_ref: cp.ndarray, pl_b: cp.ndarray, eps: float = 200, sig: 
     """
     pl_b_ft = cp.fft.fft2(gaussian_filter(pl_b, [0, sig, sig]))
     ref_ft = cp.fft.fft2(gaussian_filter(im_ref, [sig, sig]))
+    #TODO fix eps based in image size and amplitude
     pl_b_ft /= (cp.abs(pl_b_ft) + eps)
     ref_ft /= (cp.abs(ref_ft) + eps)
     corr = gaussian_filter(cp.fft.fftshift(cp.abs(cp.fft.ifft2(pl_b_ft * cp.conj(ref_ft))), axes=[1, 2]), [0, sig_map, sig_map])
     max_loc = cp.unravel_index(cp.argmax(corr, axis=(1, 2)), im_ref.shape)
-    shift = cp.array(max_loc) - cp.array(im_ref.shape)[:, None] / 2
+    shift = -cp.array(max_loc) + cp.array(im_ref.shape)[:, None] / 2
     del pl_b_ft, ref_ft
     return shift, corr
 
